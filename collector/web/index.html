@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>外部记录采集台 · 授权 / 下载 / 缓存</title>
+<style>
+  :root { --bg:#0f1420; --card:#182034; --line:#2a3550; --fg:#dfe6f5; --dim:#8b96b0;
+          --ok:#3ecf8e; --bad:#ff6b6b; --warn:#ffc857; --info:#5aa9ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  header .src { color:var(--dim); font-size:12px; }
+  main { padding:16px 20px; display:grid; gap:16px; grid-template-columns: 1fr; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  section h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  button { background:#243154; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+           padding:4px 10px; cursor:pointer; font-size:12px; }
+  button:hover { background:#2e3f6e; }
+  button.danger { border-color:#6e2e2e; color:#ffb3b3; }
+  button.good { border-color:#2e6e4e; color:#a9f0cd; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--dim); font-weight:500; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
+  .b-ok { background:#14382a; color:var(--ok); } .b-bad { background:#3d1c1c; color:var(--bad); }
+  .b-warn { background:#3d3316; color:var(--warn); } .b-info { background:#16283d; color:var(--info); }
+  .b-dim { background:#232c42; color:var(--dim); }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; }
+  .rec-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .rec-head .title { font-size:15px; font-weight:600; }
+  .rec-head .ops { margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; }
+  .bar { height:8px; background:#10182c; border-radius:4px; overflow:hidden; min-width:120px; }
+  .bar > div { height:100%; background:var(--info); transition:width .3s; }
+  .srcsim { color:var(--dim); font-size:11px; }
+  a { color:var(--info); }
+  #events { max-height:300px; overflow:auto; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:1100px){ .grid2 { grid-template-columns:1fr; } }
+  .toast { position:fixed; right:16px; bottom:16px; background:#223; border:1px solid var(--line);
+           padding:8px 14px; border-radius:8px; display:none; max-width:50vw; }
+</style>
+</head>
+<body>
+<header>
+  <h1>外部记录采集台</h1>
+  <span class="src" id="src"></span>
+  <button onclick="post('/api/sync')">⟳ 同步来源</button>
+  <button onclick="post('/api/gc')">🗑 运行 GC</button>
+  <span class="srcsim">页面每秒自动刷新；下载、撤权、恢复、查历史均可并发操作</span>
+</header>
+<main>
+  <section><h2>记录（元数据 + 附件索引 + 操作）</h2><div id="records">加载中…</div></section>
+  <div class="grid2">
+    <section><h2>下载任务</h2><div id="tasks"></div></section>
+    <section><h2>内容存储（CAS · 显式引用计数）</h2><div id="blobs"></div></section>
+  </div>
+  <section><h2>历史 / 审计事件</h2><div id="events"></div></section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short = h => h ? h.slice(0,12) + '…' : '—';
+const fmtB = n => n == null ? '—' : (n/1024).toFixed(0) + ' KB';
+const fmtT = t => new Date(t*1000).toLocaleTimeString('zh-CN', {hour12:false});
+const ST = { pending:['待下载','b-dim'], downloading:['下载中','b-info'], available:['可用','b-ok'],
+             stale:['内容已替换','b-warn'], unconfirmed:['待确认','b-warn'], revoked:['已撤权','b-bad'] };
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block';
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', 3500); }
+async function post(path){
+  const r = await fetch(path, {method:'POST'});
+  const j = await r.json().catch(()=>({}));
+  toast(r.ok ? (j.ok===false? ('提示: '+(j.error||'未执行')) : '完成: '+path) : '错误: '+(j.error||r.status));
+  refresh();
+}
+const badge = s => { const [t,c]=ST[s]||[s,'b-dim']; return `<span class="badge ${c}">${t}</span>`; };
+
+function render(st){
+  $('src').textContent = '来源: ' + st.source_url;
+  // 记录卡片
+  $('records').innerHTML = st.records.map(r => {
+    const auth = r.authorized ? '<span class="badge b-ok">已授权</span>'
+                              : '<span class="badge b-bad">已撤权</span>';
+    const rows = r.attachments.map(a => {
+      const canView = r.authorized && a.status==='available';
+      const link = canView ? `?e=${r.auth_epoch}` : `?e=${r.auth_epoch}`;
+      const acts = [
+        (r.authorized && a.status!=='available' && a.status!=='downloading')
+          ? `<button onclick="post('/api/attachments/${encodeURIComponent(a.id)}')">下载/确认</button>` : '',
+        canView ? `<a href="/preview/${encodeURIComponent(a.id)}${link}" target="_blank">预览</a>` : '<span class="srcsim">预览</span>',
+        canView ? `<a href="/download/${encodeURIComponent(a.id)}${link}">下载文件</a>` : '<span class="srcsim">下载文件</span>',
+        `<button class="srcsim" title="模拟外部来源替换内容" onclick="post('/api/source/replace/${r.id}/${encodeURIComponent(a.name)}')">来源替换</button>`,
+      ].join(' ');
+      return `<tr>
+        <td class="mono">${esc(a.name)}</td><td>v${a.version}</td><td>${fmtB(a.size)}</td>
+        <td class="mono" title="${a.sha256||''}">${short(a.sha256)}</td>
+        <td>${badge(a.status)}</td>
+        <td class="mono" title="${a.blob_hash||''}">${a.blob_hash?short(a.blob_hash):'—'}</td>
+        <td>${acts}</td></tr>`;
+    }).join('');
+    return `<div style="margin-bottom:18px">
+      <div class="rec-head">
+        <span class="title">${esc(r.title)}</span> ${auth}
+        <span class="srcsim mono">${r.id} · 授权纪元 ${r.auth_epoch}</span>
+        <span class="ops">
+          <button class="good" onclick="post('/api/records/${r.id}/download')">⬇ 全部下载</button>
+          <button class="good" onclick="post('/api/records/${r.id}/revalidate')">✔ 重新确认恢复</button>
+          <button class="danger" onclick="post('/api/source/revoke/${r.id}')">模拟来源撤权</button>
+          <button class="good" onclick="post('/api/source/grant/${r.id}')">模拟来源恢复授权</button>
+        </span>
+      </div>
+      <table><tr><th>附件</th><th>版本</th><th>大小</th><th>期望哈希</th><th>状态</th><th>内容引用</th><th>操作</th></tr>${rows}</table>
+    </div>`;
+  }).join('') || '暂无记录';
+  // 任务
+  $('tasks').innerHTML = st.tasks.length ? `<table>
+    <tr><th>任务</th><th>附件</th><th>进度</th><th>状态</th></tr>` + st.tasks.map(t => {
+      const pct = t.total ? Math.min(100, (t.bytes_done/t.total*100)) : 0;
+      const stB = {running:'b-info',done:'b-ok',aborted_revoked:'b-bad',failed:'b-warn'}[t.status]||'b-dim';
+      return `<tr><td class="mono">${t.id.slice(0,12)}</td><td class="mono">${esc(t.attachment_id)}</td>
+        <td><div class="bar"><div style="width:${pct}%"></div></div></td>
+        <td><span class="badge ${stB}">${t.status}</span> ${fmtB(t.bytes_done)}</td></tr>`;
+    }).join('') + '</table>' : '<span class="srcsim">暂无任务</span>';
+  // 内容存储
+  $('blobs').innerHTML = st.blobs.length ? `<table>
+    <tr><th>内容哈希</th><th>大小</th><th>引用计数</th><th></th></tr>` + st.blobs.map(b =>
+      `<tr><td class="mono" title="${b.hash}">${short(b.hash)}</td><td>${fmtB(b.size)}</td>
+       <td>${b.refcount}</td><td>${b.refcount>1?'<span class="badge b-info">多记录共享</span>':''}</td></tr>`
+    ).join('') + '</table>' : '<span class="srcsim">暂无内容</span>';
+  // 事件
+  $('events').innerHTML = `<table><tr><th>时间</th><th>事件</th><th>记录</th><th>详情</th></tr>` +
+    st.events.map(e => `<tr><td class="mono">${fmtT(e.ts)}</td><td class="mono">${e.kind}</td>
+      <td class="mono">${e.record_id||'—'}</td><td>${esc(e.detail||'')}</td></tr>`).join('') + '</table>';
+}
+async function refresh(){ try { render(await (await fetch('/api/state')).json()); } catch(e){} }
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>
